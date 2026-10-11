@@ -1,6 +1,8 @@
 # Third-party notices
 
-The MiniMax H3 Pixel Art Autorefiner mesh detector is adapted from
+## Proper Pixel Art
+
+The Pixel Art Auto Refiner mesh detector is adapted from
 [Proper Pixel Art](https://github.com/KennethJAllen/proper-pixel-art).
 
 Copyright (c) 2024 Kenneth Allen
@@ -22,3 +24,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## PixelOE
+
+The Pixel Art Outline Expansion, Pixel Art Pixelize, and Pixel Art Pre-Resize
+nodes are adapted from [PixelOE](https://github.com/KohakuBlueleaf/PixelOE) by
+Shin-Ying Yeh (KohakuBlueleaf), licensed under the Apache License 2.0. A copy of
+the license is in [licenses/PixelOE-LICENSE](licenses/PixelOE-LICENSE).
+
+Changes from the original: reimplemented in this pack's PyTorch style using OKLab
+instead of CIELAB; outline weights are normalized across the whole image batch;
+morphology uses replicate padding; color matching keeps only the wavelet
+low-frequency transfer; k-centroid downscaling was rewritten; k-means palette
+quantization and dithering were replaced by this pack's shared perceptual
+palette; pre-resizing processes every image in the batch.

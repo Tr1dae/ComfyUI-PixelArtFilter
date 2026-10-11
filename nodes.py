@@ -1271,6 +1271,243 @@ class PixelArtFilterTwoPass(io.ComfyNode):
         return io.NodeOutput(refined.to(intermediate), line_map.to(intermediate).unsqueeze(-1).repeat(1, 1, 1, 3))
 
 
+# Outline expansion and contrast downscaling below are adapted from PixelOE (Apache-2.0); see THIRD_PARTY_NOTICES.md.
+OUTLINE_KERNEL_SHAPES = {1: (1.0, 3), 2: (1.5, 3), 3: (2.0, 3), 4: (2.5, 5), 5: (3.0, 5), 6: (3.5, 7)}
+
+
+def outline_kernel(thickness, dtype, device):
+    radius, size = OUTLINE_KERNEL_SHAPES[thickness]
+    full = 2 * int(radius) + 1
+    offsets = torch.tensor([[-0.5, -0.5], [-0.5, 0.5], [0.5, -0.5], [0.5, 0.5], [0.0, 0.5], [0.0, -0.5], [0.5, 0.0], [-0.5, 0.0]],
+                           dtype=dtype, device=device)
+    positions = torch.stack(torch.meshgrid(torch.arange(full, dtype=dtype, device=device),
+                                           torch.arange(full, dtype=dtype, device=device), indexing="ij"), dim=-1)
+    distances = (positions[:, :, None] + offsets - int(radius)).norm(dim=-1)
+    near, far = distances.amin(dim=-1), distances.amax(dim=-1)
+    kernel = torch.where(far <= radius, 1.0, torch.where(near <= radius, (radius - near) / (far - near), 0.0))
+    crop = (full - size) // 2
+    return kernel[crop:crop + size, crop:crop + size]
+
+
+def soft_morphology(image, kernel, dilate):
+    batch, channels, height, width = image.shape
+    size = kernel.shape[0]
+    padded = torch.nn.functional.pad(image, (size // 2,) * 4, mode="replicate")
+    patches = torch.nn.functional.unfold(padded, size).view(batch, channels, size * size, height * width)
+    offsets = kernel.reshape(-1, 1) - 1.0
+    if dilate:
+        return (patches + offsets).amax(dim=2).view(batch, channels, height, width).clamp_(0.0, 1.0)
+    return (patches - offsets).amin(dim=2).view(batch, channels, height, width)
+
+
+def local_lightness_stat(lightness, kernel, stride, stat):
+    height, width = lightness.shape[-2:]
+    patches = torch.nn.functional.unfold(lightness, kernel, stride=stride, padding=kernel // 2)
+    values = stat(patches).expand(-1, patches.shape[1], -1).contiguous()
+    totals = torch.nn.functional.fold(values, (height, width), kernel, stride=stride, padding=kernel // 2)
+    counts = torch.nn.functional.fold(torch.ones_like(values), (height, width), kernel, stride=stride, padding=kernel // 2)
+    return totals / counts.clamp_min(1.0)
+
+
+def outline_expansion(images, pixel_size, thickness):
+    # Erode where the surroundings are bright and dilate where they are dark, so thin details grow to survive downscaling.
+    stride = max(1, pixel_size // 2)
+    weights = torch.empty_like(images[:, :1])
+    for index, image in enumerate(images):
+        lightness = srgb_to_oklab(image.permute(1, 2, 0).clamp(0.0, 1.0))[..., 0][None, None]
+        median = local_lightness_stat(lightness, 2 * pixel_size, stride, lambda patches: patches.median(dim=1, keepdim=True).values)
+        minimum = local_lightness_stat(lightness, pixel_size, stride, lambda patches: patches.amin(dim=1, keepdim=True))
+        maximum = local_lightness_stat(lightness, pixel_size, stride, lambda patches: patches.amax(dim=1, keepdim=True))
+        weights[index] = torch.sigmoid((median - 0.5) * 10.0 + (2.0 * median - minimum - maximum) * 3.0)[0]
+    # One scale for the whole batch so the expansion strength does not flicker between frames.
+    weights = (weights - weights.amin()) / (weights.amax() - weights.amin()).clamp_min(1e-8)
+
+    kernel = outline_kernel(thickness, images.dtype, images.device)
+    cleanup = outline_kernel(max(thickness - 1, 1), images.dtype, images.device)
+    expanded = torch.empty_like(images)
+    for index in range(images.shape[0]):
+        image = images[index:index + 1]
+        weight = weights[index:index + 1]
+        frame = soft_morphology(image, kernel, False) * weight + soft_morphology(image, kernel, True) * (1.0 - weight)
+        frame = soft_morphology(soft_morphology(frame, cleanup, False), cleanup, True)
+        expanded[index] = soft_morphology(soft_morphology(frame, cleanup, True), cleanup, False)[0]
+    return expanded, weights
+
+
+def gaussian_low_frequency(images, levels=5):
+    channels = images.shape[1]
+    for level in range(1, levels + 1):
+        radius = 2 ** level
+        taps = torch.arange(-radius, radius + 1, dtype=images.dtype, device=images.device)
+        kernel = torch.exp(-taps.square() / (2.0 * radius * radius))
+        kernel = (kernel / kernel.sum()).expand(channels, 1, -1)
+        images = torch.nn.functional.conv2d(torch.nn.functional.pad(images, (radius, radius, 0, 0), mode="replicate"),
+                                            kernel[:, :, None, :], groups=channels)
+        images = torch.nn.functional.conv2d(torch.nn.functional.pad(images, (0, 0, radius, radius), mode="replicate"),
+                                            kernel[:, :, :, None], groups=channels)
+    return images
+
+
+def contrast_downscale(images, pixel_size):
+    batch, _, height, width = images.shape
+    lab = srgb_to_oklab(images.permute(0, 2, 3, 1).clamp(0.0, 1.0)).permute(0, 3, 1, 2)
+    patches = torch.nn.functional.unfold(lab, pixel_size, stride=pixel_size).view(batch, 3, pixel_size * pixel_size, -1)
+    lightness = patches[:, 0]
+    median = lightness.median(dim=1).values
+    mean = lightness.mean(dim=1)
+    minimum = lightness.amin(dim=1)
+    maximum = lightness.amax(dim=1)
+    # Keep the dark or bright extreme when a patch's lightness is skewed toward it, otherwise the center pixel.
+    lightness = torch.where((median < mean) & (maximum - median > median - minimum), minimum,
+                            torch.where((median > mean) & (maximum - median < median - minimum), maximum,
+                                        lightness[:, lightness.shape[1] // 2]))
+    lab = torch.cat((lightness[:, None], patches[:, 1:].median(dim=2).values), dim=1)
+    lab = lab.view(batch, 3, height // pixel_size, width // pixel_size).permute(0, 2, 3, 1)
+    return oklab_to_srgb(lab).clamp(0.0, 1.0).permute(0, 3, 1, 2)
+
+
+def k_centroid_downscale(images, pixel_size):
+    # Two-means per patch, keeping the centroid of the larger cluster.
+    batch, channels, height, width = images.shape
+    patches = torch.nn.functional.unfold(images, pixel_size, stride=pixel_size).view(batch, channels, pixel_size * pixel_size, -1)
+    patches = patches.permute(0, 3, 2, 1).reshape(-1, pixel_size * pixel_size, channels)
+    centroids = torch.stack((patches.amax(dim=1), patches.amin(dim=1)), dim=1)
+    for _ in range(4):
+        labels = (patches[:, :, None] - centroids[:, None]).square().sum(dim=-1).argmin(dim=-1)
+        members = torch.nn.functional.one_hot(labels, 2).to(dtype=patches.dtype)
+        counts = members.sum(dim=1)
+        centroids = torch.where(counts[..., None] > 0, members.transpose(1, 2) @ patches / counts.clamp_min(1.0)[..., None], centroids)
+    dominant = centroids[torch.arange(centroids.shape[0], device=images.device), counts.argmax(dim=1)]
+    return dominant.view(batch, height // pixel_size, width // pixel_size, channels).permute(0, 3, 1, 2)
+
+
+class PixelArtFilterOutlineExpansion(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PixelArtFilterOutlineExpansion",
+            display_name="Pixel Art Outline Expansion",
+            description="Grows thin high-contrast details so they survive downscaling to pixel art, eroding on bright surroundings and dilating on dark ones.",
+            category="PixelArtFilter",
+            inputs=[
+                io.Image.Input("image"),
+                io.Int.Input("pixel_size", default=4, min=1, max=64, step=1,
+                             tooltip="Source pixels per output pixel. Sets the window used to judge local contrast."),
+                io.Int.Input("thickness", default=3, min=1, max=6, step=1,
+                             tooltip="How far details are expanded."),
+            ],
+            outputs=[
+                io.Image.Output(display_name="image"),
+                io.Image.Output(display_name="weight_map"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, image, pixel_size, thickness):
+        if image.shape[-1] < 3:
+            raise ValueError(f"Outline expansion requires at least 3 image channels, got {image.shape[-1]}")
+        images = image[..., :3].to(video_processing_device(image)).permute(0, 3, 1, 2)
+        expanded, weights = outline_expansion(images, pixel_size, thickness)
+        intermediate = comfy.model_management.intermediate_device()
+        return io.NodeOutput(expanded.permute(0, 2, 3, 1).to(intermediate),
+                             weights.permute(0, 2, 3, 1).to(intermediate).repeat(1, 1, 1, 3))
+
+
+class PixelArtFilterPixelize(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PixelArtFilterPixelize",
+            display_name="Pixel Art Pixelize",
+            description="Turns photos and non-pixel-art renders into pixel art: contrast-aware outline expansion, then contrast-aware downscaling and an optional palette shared by the whole batch.",
+            category="PixelArtFilter",
+            inputs=[
+                io.Image.Input("image"),
+                io.Int.Input("pixel_size", default=4, min=1, max=64, step=1,
+                             tooltip="Source pixels per output pixel."),
+                io.Int.Input("thickness", default=2, min=0, max=6, step=1,
+                             tooltip="Outline expansion before downscaling. 0 disables it."),
+                io.Combo.Input("mode", options=["contrast", "k_centroid", "nearest", "bilinear"], default="contrast",
+                               tooltip="contrast keeps dark or bright detail per pixel; k_centroid takes each pixel's dominant color."),
+                io.Int.Input("colors", default=0, min=0, max=256, step=1,
+                             tooltip="Reduce to one perceptual palette shared by every image. 0 keeps all colors."),
+                io.Boolean.Input("scale_to_original", default=True,
+                                 tooltip="Expand the pixel art back to the input dimensions."),
+            ],
+            outputs=[
+                io.Image.Output(display_name="image"),
+                io.Image.Output(display_name="weight_map"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, image, pixel_size, thickness, mode, colors, scale_to_original):
+        if image.shape[-1] < 3:
+            raise ValueError(f"Pixelize requires at least 3 image channels, got {image.shape[-1]}")
+        height, width = image.shape[1:3]
+        pad_height = -height % pixel_size
+        pad_width = -width % pixel_size
+        top = pad_height // 2
+        left = pad_width // 2
+        images = image[..., :3].to(video_processing_device(image)).permute(0, 3, 1, 2)
+        images = torch.nn.functional.pad(images, (left, pad_width - left, top, pad_height - top), mode="replicate")
+
+        if thickness > 0:
+            expanded, weights = outline_expansion(images, pixel_size, thickness)
+            expanded = (expanded - gaussian_low_frequency(expanded) + gaussian_low_frequency(images)).clamp_(0.0, 1.0)
+        else:
+            expanded, weights = images, torch.zeros_like(images[:, :1])
+
+        if mode == "contrast":
+            pixels = contrast_downscale(expanded, pixel_size)
+        elif mode == "k_centroid":
+            pixels = k_centroid_downscale(expanded, pixel_size)
+        else:
+            pixels = torch.nn.functional.interpolate(expanded, size=(images.shape[2] // pixel_size, images.shape[3] // pixel_size),
+                                                     mode={"nearest": "nearest-exact", "bilinear": "bilinear"}[mode])
+
+        pixels = pixels.permute(0, 2, 3, 1)
+        if colors > 0:
+            palette_oklab = shared_perceptual_palette(pixels, colors)
+            palette_rgb = (oklab_to_srgb(palette_oklab).clamp(0.0, 1.0) * 255.0).round() / 255.0
+            labels = nearest_palette_labels(srgb_to_oklab(pixels.clamp(0.0, 1.0)).reshape(-1, 3), palette_oklab)
+            pixels = palette_rgb[labels].view(pixels.shape)
+        weights = weights[:, :, top:top + height, left:left + width].permute(0, 2, 3, 1)
+        if scale_to_original:
+            pixels = pixels.repeat_interleave(pixel_size, dim=1).repeat_interleave(pixel_size, dim=2)
+            pixels = pixels[:, top:top + height, left:left + width]
+        intermediate = comfy.model_management.intermediate_device()
+        return io.NodeOutput(pixels.to(intermediate), weights.to(intermediate).repeat(1, 1, 1, 3))
+
+
+class PixelArtFilterPreResize(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PixelArtFilterPreResize",
+            display_name="Pixel Art Pre-Resize",
+            description="Resizes images so they divide into roughly target_pixels × target_pixels output pixels of pixel_size each, keeping the aspect ratio.",
+            category="PixelArtFilter",
+            inputs=[
+                io.Image.Input("image"),
+                io.Int.Input("target_pixels", default=256, min=1, max=4096, step=1,
+                             tooltip="Square root of the desired output pixel count, e.g. 256 for about 256×256 pixels."),
+                io.Int.Input("pixel_size", default=4, min=1, max=64, step=1,
+                             tooltip="Source pixels per output pixel after resizing."),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, image, target_pixels, pixel_size):
+        height, width = image.shape[1:3]
+        ratio = width / height
+        logical_height = (target_pixels * target_pixels / ratio) ** 0.5
+        size = (max(1, int(logical_height)) * pixel_size, max(1, int(logical_height * ratio)) * pixel_size)
+        resized = torch.nn.functional.interpolate(image.permute(0, 3, 1, 2), size=size, mode="bicubic", antialias=True)
+        return io.NodeOutput(resized.clamp(0.0, 1.0).permute(0, 2, 3, 1))
+
+
 class PixelArtFilterAutoRefiner(io.ComfyNode):
     @classmethod
     def define_schema(cls):

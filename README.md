@@ -10,7 +10,7 @@ All nodes are in the **PixelArtFilter** category.
 
 This pack started as a fork of [ComfyUI-Krea2-Pixel-Art-Refiner](https://github.com/envy-ai/ComfyUI-Krea2-Pixel-Art-Refiner) by [envy-ai](https://github.com/envy-ai), which provides the weighted OKLab palette clustering, modal grid collapse, mesh-detecting auto refiner, and animation pose compositor. The original repository was published without a license. The Temporal and Two-Pass refiners, line detection, and GPU processing are new in this pack.
 
-The Auto Refiner's mesh detector is adapted from [Proper Pixel Art](https://github.com/KennethJAllen/proper-pixel-art) by Kenneth Allen under the MIT license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The Pixelize, Outline Expansion, and Pre-Resize nodes are adapted from [PixelOE](https://github.com/KohakuBlueleaf/PixelOE) by Shin-Ying Yeh (KohakuBlueleaf) under the Apache License 2.0. The Auto Refiner's mesh detector is adapted from [Proper Pixel Art](https://github.com/KennethJAllen/proper-pixel-art) by Kenneth Allen under the MIT license. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for both licenses and the changes made.
 
 ## Installation
 
@@ -30,11 +30,16 @@ Restart ComfyUI after installation. The only extra dependency is `opencv-python-
 | **Pixel Art Refiner** | Single images or batches, with palette images, grid offsets, and processing order. |
 | **Pixel Art Auto Refiner** | Images whose pixel grid size is unknown or uneven; detects the grid mesh. |
 | **Pixel Art Simple Refiner** | Minimal palette reduction and grid collapse. |
+| **Pixel Art Pixelize** | Photos and non-pixel-art renders: contrast-aware outline expansion and downscaling. |
+| **Pixel Art Outline Expansion** | Outline expansion only, to feed other pixelizers. |
+| **Pixel Art Pre-Resize** | Resizes to a target pixel count times a pixel size. |
 | **Pixel Art Animation Pose Compositor** | Turns noisy repeated animation cycles into one clean frame per pose. |
 | **Pixel Art Palette Reduce** | Palette reduction only. |
 | **Pixel Art Grid Collapse** | Grid collapse only. |
 
-Every grid cell takes its most frequent palette color. Ties go to the color perceptually closest to the cell's center pixel in OKLab.
+The refiners expect input that already looks like pixel art on a grid, such as pixel-art generations from image or video models. For photos and ordinary renders, use Pixel Art Pixelize.
+
+In the refiners, every grid cell takes its most frequent palette color. Ties go to the color perceptually closest to the cell's center pixel in OKLab.
 
 ## Pixel Art Two-Pass Refiner
 
@@ -133,6 +138,36 @@ For batches, meshes are detected from the first frame and reused for every frame
 
 Palette reduction and grid collapse with only `width`, `height`, `colors`, `color_reduction_first`, and `scale_to_original`. Each image gets its own palette, and the image size must divide evenly by the grid.
 
+## Pixel Art Pixelize
+
+Converts images that are not pixel art, such as photos and ordinary renders, into pixel art. Each `pixel_size × pixel_size` block of the (edge-padded) input becomes one output pixel.
+
+1. Outline expansion: compare each area's lightness median, minimum, and maximum, then blend an erosion and a dilation so thin details grow by `thickness` before downscaling. Dark details on bright surroundings get thicker, and bright details on dark surroundings too. Expansion weights are normalized across the whole batch, so video does not flicker.
+2. Restore the input's low-frequency color, keeping the expanded details.
+3. Downscale with `mode`:
+   - `contrast`: per block, take the darkest or brightest lightness when the block is skewed toward it, otherwise the center pixel; chroma is the block median.
+   - `k_centroid`: per block, split colors into two clusters and keep the larger cluster's mean.
+   - `nearest` / `bilinear`: plain resampling.
+4. With `colors` above 0, map every image to one perceptual palette built from the whole batch.
+
+| Input | Default | Description |
+| --- | ---: | --- |
+| `pixel_size` | 4 | Source pixels per output pixel. |
+| `thickness` | 2 | Outline expansion, 0 to 6. `0` disables it. |
+| `mode` | contrast | Downscaling method. |
+| `colors` | 0 | Shared palette size. `0` keeps all colors. |
+| `scale_to_original` | On | Expand the result back to the input dimensions. |
+
+The second output is the expansion weight map: bright areas erode, dark areas dilate.
+
+## Pixel Art Outline Expansion
+
+Runs only the outline expansion step, with `pixel_size` setting the contrast window and `thickness` from 1 to 6. Use it in front of other pixelizers or downscalers. Outputs the expanded image and its weight map.
+
+## Pixel Art Pre-Resize
+
+Resizes images with antialiased bicubic so the result is about `target_pixels × target_pixels` output pixels of `pixel_size` each, keeping the aspect ratio. Both dimensions come out as multiples of `pixel_size`, ready for Pixel Art Pixelize or the grid refiners.
+
 ## Pixel Art Animation Pose Compositor
 
 Turns a noisy video batch of repeated animation cycles into one clean image per distinct pose.
@@ -159,5 +194,6 @@ Turns a noisy video batch of repeated animation cycles into one clean image per 
 ```text
 Video decode → Pixel Art Two-Pass Refiner → Create Video
 Image → Pixel Art Refiner → Save Image
+Photo → Pixel Art Pre-Resize → Pixel Art Pixelize → Save Image
 Video decode → Pixel Art Refiner → Animation Pose Compositor → Create Video
 ```
