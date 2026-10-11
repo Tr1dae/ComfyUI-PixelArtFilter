@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-pixelartfilter"
+version = "1.0.0"
+description = "Turn generated images and video into clean, flicker-free pixel art: shared OKLab palettes, temporal grid voting, and stable one-cell outlines on the GPU."
+requires-python = ">=3.10"
+dependencies = ["opencv-python-headless>=4.8"]
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/Tr1dae/ComfyUI-PixelArtFilter"
+Documentation = "https://github.com/Tr1dae/ComfyUI-PixelArtFilter#readme"
+"Bug Tracker" = "https://github.com/Tr1dae/ComfyUI-PixelArtFilter/issues"
+
+[tool.comfy]
+DisplayName = "Pixel Art Filter"
